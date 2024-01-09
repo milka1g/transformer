@@ -43,7 +43,7 @@ class PositionalEncoding(nn.Module):
         # Create (seq_len, d_model) matrix
         pe = torch.zeros(seq_len, d_model)
         # Create a vector of shape (seq_len, 1) for all positions
-        positions = torch.arange(0, seq_len, dtype=torch.float).unsqeueeze(1)
+        positions = torch.arange(0, seq_len, dtype=torch.float).unsqueeze(1)
         div_term = torch.exp(
             torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model)
         )
@@ -60,7 +60,7 @@ class PositionalEncoding(nn.Module):
 
     def forward(self, x):
         """Add positional encoding to every word inside the sentence"""
-        x = x + (self.pe[:, : x.shape[1], :]).requires_grad(False)
+        x = x + (self.pe[:, : x.shape[1], :]).requires_grad_(False)
         return self.dropout(x)
 
 
@@ -124,16 +124,16 @@ class MultiHeadAttentionBlock(nn.Module):
 
         # (batch, h, seq_len, d_k) ->  (batch, h, seq_len, seq_len)
         attention_scores = (query @ key.transpose(-2, -1)) / math.sqrt(d_k)
-        if mask:
+        if mask is not None:
             attention_scores.masked_fill_(mask == 0, -1e9)
         attention_scores = attention_scores.softmax(
             dim=-1
         )  # (batch, h, seq_len, seq_len)
 
-        if dropout:
+        if dropout is not None:
             attention_scores = dropout(attention_scores)
         # raw attention_scores used for visualization
-        return (attention_scores * value), attention_scores
+        return (attention_scores @ value), attention_scores
 
     def forward(self, q, k, v, mask):
         query = self.w_q(q)  # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
@@ -172,7 +172,7 @@ class ResidualConnection(nn.Module):
         """
         # In the paper first applied is sublayer then norm
         # but this is more common in implementations
-        return x + self.droput(sublayer(self.norm(x)))
+        return x + self.dropout(sublayer(self.norm(x)))
 
 
 class EncoderBlock(nn.Module):
@@ -282,6 +282,7 @@ class Transformer(nn.Module):
         tgt_pos: PositionalEncoding,
         projection_layer: ProjectionLayer,
     ):
+        super().__init__()
         self.encoder = encoder
         self.decoder = decoder
         self.src_embed = src_embed
@@ -378,5 +379,3 @@ def build_transformer(
             nn.init.xavier_uniform_(p)
 
     return transformer
-
-

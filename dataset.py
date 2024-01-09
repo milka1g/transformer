@@ -8,19 +8,20 @@ class BilingualDataset(Dataset):
         super().__init__()
 
         self.ds = ds
+        self.seq_len = seq_len
         self.tokenizer_src = tokenizer_src
         self.tokenizer_tgt = tokenizer_tgt
         self.src_lang = src_lang
         self.tgt_lang = tgt_lang
 
         self.sos_token = torch.tensor(
-            [tokenizer_src.token_to_id(["SOS"])], dtype=torch.int64
+            [tokenizer_src.token_to_id("[SOS]")], dtype=torch.int64
         )
         self.eos_token = torch.tensor(
-            [tokenizer_src.token_to_id(["EOS"])], dtype=torch.int64
+            [tokenizer_src.token_to_id("[EOS]")], dtype=torch.int64
         )
         self.pad_token = torch.tensor(
-            [tokenizer_src.token_to_id(["PAD"])], dtype=torch.int64
+            [tokenizer_src.token_to_id("[PAD]")], dtype=torch.int64
         )
 
     def __len__(self):
@@ -44,35 +45,35 @@ class BilingualDataset(Dataset):
             raise ValueError("Sentence is too long")
 
         encoder_input = torch.cat(
-            {
+            [
                 self.sos_token,
                 torch.tensor(enc_input_tokens, dtype=torch.int64),
                 self.eos_token,
                 torch.tensor(
                     [self.pad_token] * enc_num_padding_tokens, dtype=torch.int64
                 ),
-            }
+            ]
         )
 
         decoder_input = torch.cat(
-            {
+            [
                 self.sos_token,
                 torch.tensor(dec_input_tokens, dtype=torch.int64),
                 torch.tensor(
                     [self.pad_token] * dec_num_padding_tokens, dtype=torch.int64
                 ),
-            }
+            ]
         )
 
         # Expected output from decoder
         label = torch.cat(
-            {
+            [
                 torch.tensor(dec_input_tokens, dtype=torch.int64),
                 self.eos_token,
                 torch.tensor(
                     [self.pad_token] * dec_num_padding_tokens, dtype=torch.int64
                 ),
-            }
+            ]
         )
 
         assert encoder_input.size(0) == self.seq_len
@@ -98,6 +99,7 @@ class BilingualDataset(Dataset):
             "tgt_text": tgt_text,  # for viz
         }
 
-    def causal_mask(size):
-        mask = torch.triu(torch.ones(1, size, size), diagonal=1).type(torch.int)
-        return mask == 0
+
+def causal_mask(size):
+    mask = torch.triu(torch.ones(1, size, size), diagonal=1).type(torch.int)
+    return mask == 0
