@@ -96,6 +96,20 @@ class FeedForwardBlock(nn.Module):
         return self.linear_2(self.dropout(torch.relu(self.linear_1(x))))
 
 
+class Classifier(nn.Module):
+    def __init__(self, d_model, hidden_size, num_classes):
+        super().__init__()
+        self.d_model = d_model
+        self.model = nn.Sequential(
+            nn.Linear(d_model, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, num_classes),
+        )
+
+    def forward(self, x):
+        return self.model(x)
+
+
 class MultiHeadAttentionBlock(nn.Module):
     def __init__(self, d_model: int, h: int, dropout: float):
         """_summary_
@@ -133,7 +147,8 @@ class MultiHeadAttentionBlock(nn.Module):
         if dropout is not None:
             attention_scores = dropout(attention_scores)
         # raw attention_scores used for visualization
-        return (attention_scores @ value), attention_scores
+        # return (attention_scores @ value), attention_scores
+        return attention_scores @ value
 
     def forward(self, q, k, v, mask):
         query = self.w_q(q)  # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
@@ -150,9 +165,7 @@ class MultiHeadAttentionBlock(nn.Module):
             1, 2
         )
 
-        x, self.attention_scores = MultiHeadAttentionBlock.attention(
-            query, key, value, mask, self.dropout
-        )
+        x = MultiHeadAttentionBlock.attention(query, key, value, mask, self.dropout)
         # (batch, h, seq_len, d_k) -> (batch, seq_len, h, d_k) -> (batch, seq_len, d_model)
         x = x.transpose(1, 2).contiguous().view(x.shape[0], -1, self.h * self.d_k)
         # (batch, seq_len, d_model) -> (batch, seq_len, d_model)
@@ -276,6 +289,7 @@ class Transformer(nn.Module):
         self,
         encoder: Encoder,
         decoder: Decoder,
+        classifier: Classifier,
         src_embed: InputEmbeddings,
         tgt_embed: InputEmbeddings,
         src_pos: PositionalEncoding,
@@ -285,6 +299,7 @@ class Transformer(nn.Module):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
+        self.classifier = classifier
         self.src_embed = src_embed
         self.tgt_embed = tgt_embed
         self.src_pos = src_pos
@@ -310,11 +325,12 @@ def build_transformer(
     tgt_vocab_size: int,
     src_seq_len: int,
     tgt_seq_len: int,
+    num_classes: int,
     d_model: int = 512,
     N: int = 6,
     h: int = 8,
     dropout: float = 0.1,
-    d_ff: int = 2048,
+    d_ff: int = 256,
 ) -> Transformer:
     """_summary_
 
@@ -367,10 +383,19 @@ def build_transformer(
     # Create the projection layer
     # Project from source to target language
     projection_layer = ProjectionLayer(d_model, tgt_vocab_size)
+    # Classifier used after pretraining, one hidden layer
+    classifier = Classifier(d_model, int((d_model + num_classes) / 2), num_classes)
 
     # Create the transformer
     transformer = Transformer(
-        encoder, decoder, src_embed, tgt_embed, src_pos, tgt_pos, projection_layer
+        encoder,
+        decoder,
+        classifier,
+        src_embed,
+        tgt_embed,
+        src_pos,
+        tgt_pos,
+        projection_layer,
     )
 
     # Init params with xavier uniform

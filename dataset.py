@@ -29,12 +29,15 @@ class BilingualDataset(Dataset):
 
     def __getitem__(self, index):
         src_target_pair = self.ds[index]
-        src_text = src_target_pair["translation"][self.src_lang]
-        tgt_text = src_target_pair["translation"][self.tgt_lang]
+        src_text = src_target_pair[self.src_lang]
+        tgt_text = src_target_pair[self.tgt_lang]
+        family = torch.tensor(src_target_pair["le_label"])
 
         # Encode text and get array of ids
         enc_input_tokens = self.tokenizer_src.encode(src_text).ids
         dec_input_tokens = self.tokenizer_tgt.encode(tgt_text).ids
+        # Use tokenizer of source to encode target text because encoder learned attention on it
+        enc_class_input_tokens = self.tokenizer_src.encode(tgt_text).ids
 
         # Pad to reach seq_len, -2 enc because of SOS and EOS, -1 dec SOS
         enc_num_padding_tokens = self.seq_len - len(enc_input_tokens) - 2
@@ -48,6 +51,17 @@ class BilingualDataset(Dataset):
             [
                 self.sos_token,
                 torch.tensor(enc_input_tokens, dtype=torch.int64),
+                self.eos_token,
+                torch.tensor(
+                    [self.pad_token] * enc_num_padding_tokens, dtype=torch.int64
+                ),
+            ]
+        )
+
+        enc_class_input = torch.cat(
+            [
+                self.sos_token,
+                torch.tensor(enc_class_input_tokens, dtype=torch.int64),
                 self.eos_token,
                 torch.tensor(
                     [self.pad_token] * enc_num_padding_tokens, dtype=torch.int64
@@ -78,6 +92,7 @@ class BilingualDataset(Dataset):
 
         assert encoder_input.size(0) == self.seq_len
         assert decoder_input.size(0) == self.seq_len
+        assert enc_class_input.size(0) == self.seq_len
         assert label.size(0) == self.seq_len
 
         return {
@@ -95,8 +110,14 @@ class BilingualDataset(Dataset):
             & causal_mask(decoder_input.size(0)),
             # (1, seq_len) * (1, seq_len, seq_len)
             "label": label,  # (seq_len)
-            "src_text": src_text,  # for viz
-            "tgt_text": tgt_text,  # for viz
+            # "src_text": src_text,  # for viz
+            # "tgt_text": tgt_text,  # for viz
+            "enc_class_input": enc_class_input,
+            "enc_class_mask": (enc_class_input != self.pad_token)
+            .unsqueeze(0)
+            .unsqueeze(0)
+            .int(),
+            "family": family,
         }
 
 

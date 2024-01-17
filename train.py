@@ -3,20 +3,31 @@ import torch
 import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
+import pandas as pd
+import pyarrow as pa
 
 from config import get_weights_file_path, get_config
 
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
+from matplotlib import pyplot as plt
+from sklearn.preprocessing import LabelEncoder
 
 from dataset import BilingualDataset, causal_mask
 from model import build_transformer
 from tqdm import tqdm
 
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
+
 import warnings
+
+# Initialize the PyTorch distributed backend
+# This is essential even for single machine, multiple GPU training
+# dist.init_process_group(backend='nccl', init_method='tcp://localhost:FREE_PORT', world_size=1, rank=0)
 
 
 def greedy_decode(
@@ -72,7 +83,7 @@ def run_validation(
     device,
     print_msg,
     global_state,
-    writer,
+    writer=None,
     num_examples=2,
 ):
     model.eval()
@@ -127,8 +138,7 @@ def run_validation(
 
 
 def get_all_sentences(ds, lang):
-    for item in ds:
-        yield item["translation"][lang]
+    return ds[lang]
 
 
 def get_or_build_tokenizer(config, ds, lang):
@@ -148,13 +158,17 @@ def get_or_build_tokenizer(config, ds, lang):
 
 
 def get_ds(config):
-    ds_raw = load_dataset(
-        "opus_books", f"{config['lang_src']}-{config['lang_tgt']}", split="train"
-    )
+    ds_raw = pd.read_csv(config["input"])
+
+    le = LabelEncoder()
+    le.fit(ds_raw["label"])
+
+    ds_raw["le_label"] = le.transform(ds_raw["label"])
+    ds_raw = Dataset(pa.Table.from_pandas(ds_raw))
 
     # Build tokenizers
-    tokenizer_src = get_or_build_tokenizer(config, ds_raw, config["lang_src"])
-    tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config["lang_tgt"])
+    tokenizer_src = get_or_build_tokenizer(config, ds_raw, config["src"])
+    tokenizer_tgt = get_or_build_tokenizer(config, ds_raw, config["tgt"])
 
     # Keep 90% training and 10% validation
     train_ds_size = int(0.9 * len(ds_raw))
@@ -165,46 +179,52 @@ def get_ds(config):
         train_ds_raw,
         tokenizer_src,
         tokenizer_tgt,
-        config["lang_src"],
-        config["lang_tgt"],
+        config["src"],
+        config["tgt"],
         config["seq_len"],
     )
     val_ds = BilingualDataset(
         val_ds_raw,
         tokenizer_src,
         tokenizer_tgt,
-        config["lang_src"],
-        config["lang_tgt"],
+        config["src"],
+        config["tgt"],
         config["seq_len"],
     )
 
-    max_len_src = 0
-    max_len_tgt = 0
+    # max_len_src = 0
+    # max_len_tgt = 0
 
-    for item in ds_raw:
-        src_ids = tokenizer_src.encode(item["translation"][config["lang_src"]]).ids
-        tgt_ids = tokenizer_tgt.encode(item["translation"][config["lang_tgt"]]).ids
-        max_len_src = max(max_len_src, len(src_ids))
-        max_len_tgt = max(max_len_tgt, len(tgt_ids))
+    # for item in ds_raw:
+    #     src_ids = tokenizer_src.encode(item["translation"][config["src"]]).ids
+    #     tgt_ids = tokenizer_tgt.encode(item["translation"][config["tgt"]]).ids
+    #     max_len_src = max(max_len_src, len(src_ids))
+    #     max_len_tgt = max(max_len_tgt, len(tgt_ids))
 
-    print(f"Max length of source sentence: {max_len_src}")
-    print(f"Max length of target sentence: {max_len_tgt}")
+    # print(f"Max length of source sentence: {max_len_src}")
+    # print(f"Max length of target sentence: {max_len_tgt}")
 
     train_dataloader = DataLoader(
-        train_ds, batch_size=config["batch_size"], shuffle=True
+        train_ds,
+        batch_size=config["batch_size"],
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        persistent_workers=True,
     )
-    val_dataloader = DataLoader(val_ds, batch_size=1, shuffle=True)
+    val_dataloader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
 
-    return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt
+    return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt, le
 
 
-def get_model(config, vocab_src_len, vocab_tgt_len):
+def get_model(config, vocab_src_len, vocab_tgt_len, num_classes):
     # In case of too big model decrease h or N
     model = build_transformer(
         vocab_src_len,
         vocab_tgt_len,
         config["seq_len"],
         config["seq_len"],
+        num_classes,
         config["d_model"],
     )
     return model
@@ -217,14 +237,19 @@ def train_model(config):
 
     Path(config["model_folder"]).mkdir(parents=True, exist_ok=True)
 
-    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt = get_ds(config)
+    train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt, le = get_ds(config)
 
     model = get_model(
-        config, tokenizer_src.get_vocab_size(), tokenizer_tgt.get_vocab_size()
+        config,
+        tokenizer_src.get_vocab_size(),
+        tokenizer_tgt.get_vocab_size(),
+        len(le.classes_),
     ).to(device)
 
+    # model = DistributedDataParallel(model)
+
     # Tensorboard
-    writer = SummaryWriter(config["experiment_name"])
+    # writer = SummaryWriter(config["experiment_name"])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], eps=1e-9)
 
@@ -243,6 +268,11 @@ def train_model(config):
         ignore_index=tokenizer_src.token_to_id("[PAD]"), label_smoothing=0.1
     ).to(device)
 
+    train_loss_list = []
+    val_loss_list = []
+
+    # First pretrain the whole model on a task of translating
+    # corrupted sequences to original ones
     for epoch in range(initial_epoch, config["num_epochs"]):
         batch_iterator = tqdm(train_dataloader, desc=f"Processing epochs {epoch:02d}")
         for batch in batch_iterator:
@@ -273,8 +303,8 @@ def train_model(config):
             batch_iterator.set_postfix({f"loss:": f"{loss.item():6.3f}"})
 
             # Log the loss on tensorboard
-            writer.add_scalar("train_loss", loss.item(), global_step)
-            writer.flush()
+            # writer.add_scalar("train_loss", loss.item(), global_step)
+            # writer.flush()
 
             # Backprop
             loss.backward()
@@ -308,6 +338,100 @@ def train_model(config):
             },
             model_filename,
         )
+
+    # Then fine-tune the classifier using the encoder embeddings to predict protein families
+    # Freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    # Unfreeze only the classifier
+    for param in model.classifier.parameters():
+        param.requires_grad = True
+
+    initial_epoch = 0
+    optimizer = torch.optim.Adam(
+        model.classifier.parameters(), lr=config["lr"], eps=1e-9
+    )
+
+    for epoch in range(config["num_epochs"]):
+        batch_iterator = tqdm(train_dataloader, desc=f"Processing epochs {epoch:02d}")
+        train_loss = 0
+        for batch in batch_iterator:
+            model.train()
+            enc_class_input = batch["enc_class_input"].to(device)  # (B, seq_len)
+            enc_class_mask = batch["enc_class_mask"].to(device)  # (B, seq_len)
+            enc_output = model.encode(
+                enc_class_input, enc_class_mask
+            )  # (B, seq_len, d_model)
+
+            # Approach 1: Mean Pooling
+            # pooled_encoder_output = torch.mean(enc_output, dim=1)
+            # Approach 2: Using [CLS] or in our case [SOS] token - 0th index
+            # The first token of every sequence is always a special classification token ([CLS]).
+            # The final hidden state corresponding to this token is used as the aggregate sequence representation
+            # for classification tasks.
+            sos_encoder_output = enc_output[:, 0, :]
+
+            classifier_output = model.classifier(
+                sos_encoder_output
+            )  # or sos_encoder_output
+            target = batch["family"].to(device)  # (B, 1)
+            # (B, seq_len, src_vocab_size) -> (B * seq_len, tgt_vocab_size)
+            # should be
+            # (B, d_model) -> (B, len(le.classes_))
+            loss = loss_fn(
+                classifier_output,
+                target,
+            )
+            train_loss += loss.item()
+            batch_iterator.set_postfix({f"cl_loss:": f"{loss.item():6.3f}"})
+            loss.backward()
+            optimizer.step()
+            optimizer.zero_grad()
+
+        train_loss = train_loss / len(train_dataloader)
+        train_loss_list.append(train_loss)
+        # Validation
+        val_loss = 0
+        model.eval()
+        with torch.no_grad():
+            for batch in val_dataloader:
+                enc_class_input = batch["enc_class_input"].to(device)  # (B, seq_len)
+                enc_class_mask = batch["enc_class_mask"].to(device)  # (B, seq_len)
+                enc_output = model.encode(
+                    enc_class_input, enc_class_mask
+                )  # (B, seq_len, d_model)
+                sos_encoder_output = enc_output[:, 0, :]
+                classifier_output = model.classifier(sos_encoder_output)
+                target = batch["family"].to(device)  # (B, seq_len)
+                # (B, seq_len, src_vocab_size) -> (B * seq_len, tgt_vocab_size)
+                loss = loss_fn(
+                    classifier_output,
+                    target,
+                )
+                val_loss += loss.item()
+        val_loss = val_loss / len(val_dataloader)
+        val_loss_list.append(val_loss)
+    # Save model at the end of every epoch
+    model_filename = get_weights_file_path(config, f"fin")
+    torch.save(
+        {
+            "epoch": 222,
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "global_step": global_step,
+        },
+        model_filename,
+    )
+    # Plot loss
+    fig, ax = plt.subplots()
+    ax.plot(val_loss_list, label="Validation")
+    ax.plot(train_loss_list, label="Training")
+    ax.set_ylabel("loss")
+    ax.set_xlabel("epoch")
+    ax.legend(loc="upper left")
+    ax.set_frame_on(False)
+    plt.tight_layout()
+    plt.savefig(f"loss.png")
 
 
 if __name__ == "__main__":
