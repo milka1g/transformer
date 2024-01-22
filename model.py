@@ -127,10 +127,10 @@ class MultiHeadAttentionBlock(nn.Module):
         self.d_k = d_model // h
         self.dropout = nn.Dropout(dropout)
 
-        self.w_q = nn.Linear(d_model, d_model)
-        self.w_k = nn.Linear(d_model, d_model)
-        self.w_v = nn.Linear(d_model, d_model)
-        self.w_o = nn.Linear(d_model, d_model)
+        self.w_q = nn.Linear(d_model, d_model, bias=False)
+        self.w_k = nn.Linear(d_model, d_model, bias=False)
+        self.w_v = nn.Linear(d_model, d_model, bias=False)
+        self.w_o = nn.Linear(d_model, d_model, bias=False)
 
     @staticmethod
     def attention(query, key, value, mask, dropout: nn.Dropout):

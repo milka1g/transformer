@@ -1,33 +1,53 @@
+import os
+import warnings
 from pathlib import Path
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader, random_split
-from torch.utils.tensorboard import SummaryWriter
+
+import datasets
+from matplotlib import pyplot as plt
 import pandas as pd
 import pyarrow as pa
-
-from config import get_weights_file_path, get_config
-
-from datasets import load_dataset, Dataset
+from sklearn.preprocessing import LabelEncoder
+from sklearn.metrics import accuracy_score, f1_score
+import torch
+import torch.nn as nn
+from torch.utils import data
+from torch.optim.lr_scheduler import LambdaLR
+from torch.utils.tensorboard import SummaryWriter
+import torch.distributed as dist
 from tokenizers import Tokenizer
 from tokenizers.models import WordLevel
 from tokenizers.trainers import WordLevelTrainer
 from tokenizers.pre_tokenizers import Whitespace
-from matplotlib import pyplot as plt
-from sklearn.preprocessing import LabelEncoder
-
-from dataset import BilingualDataset, causal_mask
-from model import build_transformer
 from tqdm import tqdm
 
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel
+# Enable Multi-GPU training
+from torch.nn.parallel import DistributedDataParallel as DDP
+import torch.multiprocessing as mp
+from torch.utils.data.distributed import DistributedSampler
+from torch.distributed import init_process_group, destroy_process_group
 
-import warnings
+
+from model import build_transformer
+from dataset import BilingualDataset, causal_mask
+from config import get_weights_file_path, get_config
+
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "caching_allocator"
+
 
 # Initialize the PyTorch distributed backend
 # This is essential even for single machine, multiple GPU training
 # dist.init_process_group(backend='nccl', init_method='tcp://localhost:FREE_PORT', world_size=1, rank=0)
+# The distributed process group contains all the processes that can communicate and synchronize with each other.
+def ddp_setup(rank, world_size):
+    """
+    Args:
+        rank: Unique identifier of each process
+        world_size: Total number of processes
+    """
+    os.environ["MASTER_ADDR"] = "localhost"
+    os.environ["MASTER_PORT"] = "12356"
+    init_process_group(backend="nccl", rank=rank, world_size=world_size)
+    torch.cuda.set_device(rank)
 
 
 def greedy_decode(
@@ -164,7 +184,7 @@ def get_ds(config):
     le.fit(ds_raw["label"])
 
     ds_raw["le_label"] = le.transform(ds_raw["label"])
-    ds_raw = Dataset(pa.Table.from_pandas(ds_raw))
+    ds_raw = datasets.Dataset(pa.Table.from_pandas(ds_raw))
 
     # Build tokenizers
     tokenizer_src = get_or_build_tokenizer(config, ds_raw, config["src"])
@@ -173,7 +193,7 @@ def get_ds(config):
     # Keep 90% training and 10% validation
     train_ds_size = int(0.9 * len(ds_raw))
     val_ds_size = len(ds_raw) - train_ds_size
-    train_ds_raw, val_ds_raw = random_split(ds_raw, [train_ds_size, val_ds_size])
+    train_ds_raw, val_ds_raw = data.random_split(ds_raw, [train_ds_size, val_ds_size])
 
     train_ds = BilingualDataset(
         train_ds_raw,
@@ -204,15 +224,18 @@ def get_ds(config):
     # print(f"Max length of source sentence: {max_len_src}")
     # print(f"Max length of target sentence: {max_len_tgt}")
 
-    train_dataloader = DataLoader(
+    train_dataloader = data.DataLoader(
         train_ds,
         batch_size=config["batch_size"],
-        shuffle=True,
+        shuffle=False,
         num_workers=4,
         pin_memory=True,
         persistent_workers=True,
+        sampler=DistributedSampler(train_ds),
     )
-    val_dataloader = DataLoader(val_ds, batch_size=config["batch_size"], shuffle=False)
+    val_dataloader = data.DataLoader(
+        val_ds, batch_size=config["batch_size"], shuffle=False
+    )
 
     return train_dataloader, val_dataloader, tokenizer_src, tokenizer_tgt, le
 
@@ -230,10 +253,11 @@ def get_model(config, vocab_src_len, vocab_tgt_len, num_classes):
     return model
 
 
-def train_model(config):
+def train_model(rank, config, world_size):
     # Define the device
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device {device}")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # print(f"Using device {device}")
+    ddp_setup(rank, world_size)
 
     Path(config["model_folder"]).mkdir(parents=True, exist_ok=True)
 
@@ -244,12 +268,11 @@ def train_model(config):
         tokenizer_src.get_vocab_size(),
         tokenizer_tgt.get_vocab_size(),
         len(le.classes_),
-    ).to(device)
+    ).to(rank)
+    model = DDP(model, device_ids=[rank])
 
     # model = DistributedDataParallel(model)
-
-    # Tensorboard
-    # writer = SummaryWriter(config["experiment_name"])
+    writer = SummaryWriter(config["experiment_name"])
 
     optimizer = torch.optim.Adam(model.parameters(), lr=config["lr"], eps=1e-9)
 
@@ -266,34 +289,40 @@ def train_model(config):
 
     loss_fn = nn.CrossEntropyLoss(
         ignore_index=tokenizer_src.token_to_id("[PAD]"), label_smoothing=0.1
-    ).to(device)
+    ).to(rank)
 
     train_loss_list = []
     val_loss_list = []
+    acc_list = []
+    f1_list = []
 
     # First pretrain the whole model on a task of translating
     # corrupted sequences to original ones
     for epoch in range(initial_epoch, config["num_epochs"]):
         batch_iterator = tqdm(train_dataloader, desc=f"Processing epochs {epoch:02d}")
+        train_dataloader.sampler.set_epoch(epoch)
+        print(f"GPU: {rank} Epoch: {epoch}")
         for batch in batch_iterator:
             model.train()
-            encoder_input = batch["encoder_input"].to(device)  # (B, seq_len)
-            decoder_input = batch["decoder_input"].to(device)  # (B, seq_len)
+            encoder_input = batch["encoder_input"].to(rank)  # (B, seq_len)
+            decoder_input = batch["decoder_input"].to(rank)  # (B, seq_len)
             #  hides [PAD] tokens
-            encoder_mask = batch["encoder_mask"].to(device)  # (B, 1, 1, seq_len)
+            encoder_mask = batch["encoder_mask"].to(rank)  # (B, 1, 1, seq_len)
             #  hides subsequent tokens
-            decoder_mask = batch["decoder_mask"].to(device)  # (B, 1, seq_len, seq_len)
+            decoder_mask = batch["decoder_mask"].to(rank)  # (B, 1, seq_len, seq_len)
 
             # Run the tensors through the transformer
-            encoder_output = model.encode(
+            encoder_output = model.module.encode(
                 encoder_input, encoder_mask
             )  # (B, seq_len, d_model)
-            decoder_output = model.decode(
+            decoder_output = model.module.decode(
                 encoder_output, encoder_mask, decoder_input, decoder_mask
             )  # (B, seq_len, d_model)
-            proj_output = model.project(decoder_output)  # (B, seq_len, tgt_vocab_size)
+            proj_output = model.module.project(
+                decoder_output
+            )  # (B, seq_len, tgt_vocab_size)
 
-            label = batch["label"].to(device)  # (B, seq_len)
+            label = batch["label"].to(rank)  # (B, seq_len)
 
             # (B, seq_len, tgt_vocab_size) -> (B * seq_len, tgt_vocab_size)
             loss = loss_fn(
@@ -302,9 +331,9 @@ def train_model(config):
 
             batch_iterator.set_postfix({f"loss:": f"{loss.item():6.3f}"})
 
-            # Log the loss on tensorboard
-            # writer.add_scalar("train_loss", loss.item(), global_step)
-            # writer.flush()
+            # Log the loss
+            writer.add_scalar("train_loss", loss.item(), global_step)
+            writer.flush()
 
             # Backprop
             loss.backward()
@@ -313,43 +342,31 @@ def train_model(config):
             optimizer.step()
             optimizer.zero_grad()
 
-            # run_validation(
-            #     model,
-            #     val_dataloader,
-            #     tokenizer_src,
-            #     tokenizer_tgt,
-            #     config["seq_len"],
-            #     device,
-            #     lambda msg: batch_iterator.write(msg),
-            #     global_step,
-            #     writer,
-            # )
-
             global_step += 1
 
         # Save model at the end of every epoch
-        model_filename = get_weights_file_path(config, f"{epoch:02f}")
-        torch.save(
-            {
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "global_step": global_step,
-            },
-            model_filename,
-        )
+        # model_filename = get_weights_file_path(config, f"{epoch:02f}")
+        # torch.save(
+        #     {
+        #         "epoch": epoch,
+        #         "model_state_dict": model.module.state_dict(),
+        #         "optimizer_state_dict": optimizer.state_dict(),
+        #         "global_step": global_step,
+        #     },
+        #     model_filename,
+        # )
 
     # Then fine-tune the classifier using the encoder embeddings to predict protein families
     # Freeze all parameters
     for param in model.parameters():
         param.requires_grad = False
     # Unfreeze only the classifier
-    for param in model.classifier.parameters():
+    for param in model.module.classifier.parameters():
         param.requires_grad = True
 
     initial_epoch = 0
     optimizer = torch.optim.Adam(
-        model.classifier.parameters(), lr=config["lr"], eps=1e-9
+        model.module.classifier.parameters(), lr=config["lr"], eps=1e-9
     )
 
     for epoch in range(config["num_epochs"]):
@@ -357,9 +374,9 @@ def train_model(config):
         train_loss = 0
         for batch in batch_iterator:
             model.train()
-            enc_class_input = batch["enc_class_input"].to(device)  # (B, seq_len)
-            enc_class_mask = batch["enc_class_mask"].to(device)  # (B, seq_len)
-            enc_output = model.encode(
+            enc_class_input = batch["enc_class_input"].to(rank)  # (B, seq_len)
+            enc_class_mask = batch["enc_class_mask"].to(rank)  # (B, seq_len)
+            enc_output = model.module.encode(
                 enc_class_input, enc_class_mask
             )  # (B, seq_len, d_model)
 
@@ -371,10 +388,10 @@ def train_model(config):
             # for classification tasks.
             sos_encoder_output = enc_output[:, 0, :]
 
-            classifier_output = model.classifier(
+            classifier_output = model.module.classifier(
                 sos_encoder_output
             )  # or sos_encoder_output
-            target = batch["family"].to(device)  # (B, 1)
+            target = batch["family"].to(rank)  # (B, 1)
             # (B, seq_len, src_vocab_size) -> (B * seq_len, tgt_vocab_size)
             # should be
             # (B, d_model) -> (B, len(le.classes_))
@@ -390,38 +407,55 @@ def train_model(config):
 
         train_loss = train_loss / len(train_dataloader)
         train_loss_list.append(train_loss)
+
         # Validation
         val_loss = 0
         model.eval()
         with torch.no_grad():
+            acc = 0
+            f1 = 0
             for batch in val_dataloader:
-                enc_class_input = batch["enc_class_input"].to(device)  # (B, seq_len)
-                enc_class_mask = batch["enc_class_mask"].to(device)  # (B, seq_len)
-                enc_output = model.encode(
+                enc_class_input = batch["enc_class_input"].to(rank)  # (B, seq_len)
+                enc_class_mask = batch["enc_class_mask"].to(rank)  # (B, seq_len)
+                enc_output = model.module.encode(
                     enc_class_input, enc_class_mask
                 )  # (B, seq_len, d_model)
                 sos_encoder_output = enc_output[:, 0, :]
-                classifier_output = model.classifier(sos_encoder_output)
-                target = batch["family"].to(device)  # (B, seq_len)
+                classifier_output = model.module.classifier(sos_encoder_output)
+                target = batch["family"].to(rank)  # (B, seq_len)
                 # (B, seq_len, src_vocab_size) -> (B * seq_len, tgt_vocab_size)
                 loss = loss_fn(
                     classifier_output,
                     target,
                 )
                 val_loss += loss.item()
+
+                # Accuracy and f1
+                acc += accuracy_score(
+                    target.cpu(), torch.argmax(classifier_output, dim=1).cpu()
+                )
+                f1 += f1_score(
+                    target.cpu(),
+                    torch.argmax(classifier_output, dim=1).cpu(),
+                    average="macro",
+                )
+        acc = acc / len(val_dataloader)
+        acc_list.append(acc)
+        f1 = f1 / len(val_dataloader)
+        f1_list.append(f1)
         val_loss = val_loss / len(val_dataloader)
         val_loss_list.append(val_loss)
     # Save model at the end of every epoch
-    model_filename = get_weights_file_path(config, f"fin")
-    torch.save(
-        {
-            "epoch": 222,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "global_step": global_step,
-        },
-        model_filename,
-    )
+    # model_filename = get_weights_file_path(config, f"fin")
+    # torch.save(
+    #     {
+    #         "epoch": 222,
+    #         "model_state_dict": model.module.state_dict(),
+    #         "optimizer_state_dict": optimizer.state_dict(),
+    #         "global_step": global_step,
+    #     },
+    #     model_filename,
+    # )
     # Plot loss
     fig, ax = plt.subplots()
     ax.plot(val_loss_list, label="Validation")
@@ -431,10 +465,22 @@ def train_model(config):
     ax.legend(loc="upper left")
     ax.set_frame_on(False)
     plt.tight_layout()
-    plt.savefig(f"loss.png")
+    plt.savefig(f"loss_{rank}.png")
+    # Plot scores
+    fig, ax = plt.subplots()
+    ax.plot(acc_list, label="Accuracy")
+    ax.plot(f1_list, label="F1_score")
+    ax.set_ylabel("score")
+    ax.set_xlabel("epoch")
+    ax.legend(loc="upper left")
+    ax.set_frame_on(False)
+    plt.tight_layout()
+    plt.savefig(f"score_{rank}.png")
 
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     config = get_config()
-    train_model(config)
+    world_size = torch.cuda.device_count()
+    mp.spawn(train_model, args=(config, world_size), nprocs=world_size)
+    # train_model(config)
